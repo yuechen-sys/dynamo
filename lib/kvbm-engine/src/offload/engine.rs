@@ -42,6 +42,7 @@ use crate::worker::RemoteDescriptor;
 use crate::{BlockId, G1, G2, G3, SequenceHash};
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_logical::blocks::{BlockMetadata, BlockRegistry, WeakBlock};
+use kvbm_logical::events::KvCacheEvent;
 use kvbm_logical::manager::BlockManager;
 use kvbm_physical::transfer::{PhysicalLayout, TransferOptions};
 
@@ -269,6 +270,9 @@ pub struct OffloadEngineBuilder {
     runtime: Option<tokio::runtime::Handle>,
     /// Enable remote G4 offloading via workers' ObjectBlockOps (for distributed mode)
     enable_remote_g4: bool,
+    /// Optional broadcast sender for G4 offload completion events.
+    /// Emits `KvCacheEvent::Create` for each block successfully uploaded to G4.
+    event_sender: Option<tokio::sync::broadcast::Sender<KvCacheEvent>>,
 }
 
 impl OffloadEngineBuilder {
@@ -287,6 +291,7 @@ impl OffloadEngineBuilder {
             g2_to_g4_config: None,
             runtime: None,
             enable_remote_g4: false,
+            event_sender: None,
         }
     }
 
@@ -380,6 +385,20 @@ impl OffloadEngineBuilder {
         self
     }
 
+    /// Set an event sender for notifying about successful G4 offloads.
+    ///
+    /// When configured, the offload engine emits `KvCacheEvent::Create` events
+    /// for each block successfully uploaded to G4 object storage. This enables
+    /// KV Router and other downstream subscribers to track G4 tier availability
+    /// without querying object storage on every routing decision.
+    pub fn with_event_sender(
+        mut self,
+        sender: tokio::sync::broadcast::Sender<KvCacheEvent>,
+    ) -> Self {
+        self.event_sender = Some(sender);
+        self
+    }
+
     /// Build the offload engine.
     pub fn build(self) -> Result<OffloadEngine> {
         let registry = self
@@ -446,6 +465,7 @@ impl OffloadEngineBuilder {
                 LogicalLayoutHandle::G2,
                 self.leader.clone(),
                 runtime.clone(),
+                self.event_sender,
             ))
         } else {
             None

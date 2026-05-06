@@ -43,6 +43,7 @@ use crate::object::ObjectBlockOps;
 use crate::{BlockId, SequenceHash};
 use kvbm_common::LogicalLayoutHandle;
 use kvbm_logical::blocks::{BlockMetadata, BlockRegistry, ImmutableBlock};
+use kvbm_logical::events::KvCacheEvent;
 use kvbm_logical::manager::BlockManager;
 use kvbm_physical::transfer::TransferOptions;
 
@@ -643,6 +644,7 @@ impl<Src: BlockMetadata> ObjectPipeline<Src> {
     /// * `src_layout` - Source physical layout for reading block data
     /// * `leader` - Instance leader for precondition events
     /// * `runtime` - Tokio runtime handle for spawning background tasks
+    /// * `event_sender` - Optional broadcast sender for G4 offload completion events
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ObjectPipelineConfig<Src>,
@@ -650,6 +652,7 @@ impl<Src: BlockMetadata> ObjectPipeline<Src> {
         src_layout: LogicalLayoutHandle,
         leader: Arc<InstanceLeader>,
         runtime: tokio::runtime::Handle,
+        event_sender: Option<tokio::sync::broadcast::Sender<KvCacheEvent>>,
     ) -> Self {
         // Create cancellable queues
         let eval_queue: Arc<CancellableQueue<PipelineInput<Src>>> =
@@ -720,6 +723,7 @@ impl<Src: BlockMetadata> ObjectPipeline<Src> {
             config.skip_transfers,
             config.max_concurrent_transfers,
             config.lock_manager.clone(),
+            event_sender,
         );
         let transfer_handle = runtime.spawn(async move {
             executor.run().await;
@@ -1607,6 +1611,8 @@ pub struct ObjectTransferExecutor<Src: BlockMetadata> {
     max_concurrent_transfers: usize,
     /// Optional lock manager for creating meta files and releasing locks
     lock_manager: Option<Arc<dyn ObjectLockManager>>,
+    /// Optional event sender for G4 offload completion notifications
+    event_sender: Option<tokio::sync::broadcast::Sender<KvCacheEvent>>,
 }
 
 /// Shared state for ObjectTransferExecutor that can be cloned across concurrent tasks.
@@ -1615,6 +1621,10 @@ struct SharedObjectExecutorState {
     src_layout: LogicalLayoutHandle,
     skip_transfers: bool,
     lock_manager: Option<Arc<dyn ObjectLockManager>>,
+    /// Optional event sender for notifying about successful G4 offloads.
+    /// When provided, `KvCacheEvent::Create` is emitted for each block
+    /// successfully uploaded to object storage, enabling KV Router G4 awareness.
+    event_sender: Option<tokio::sync::broadcast::Sender<KvCacheEvent>>,
 }
 
 impl<Src: BlockMetadata> ObjectTransferExecutor<Src> {
@@ -1627,6 +1637,7 @@ impl<Src: BlockMetadata> ObjectTransferExecutor<Src> {
         skip_transfers: bool,
         max_concurrent_transfers: usize,
         lock_manager: Option<Arc<dyn ObjectLockManager>>,
+        event_sender: Option<tokio::sync::broadcast::Sender<KvCacheEvent>>,
     ) -> Self {
         Self {
             input_rx,
@@ -1635,6 +1646,7 @@ impl<Src: BlockMetadata> ObjectTransferExecutor<Src> {
             skip_transfers,
             max_concurrent_transfers,
             lock_manager,
+            event_sender,
         }
     }
 
@@ -1651,6 +1663,7 @@ impl<Src: BlockMetadata> ObjectTransferExecutor<Src> {
             src_layout: self.src_layout,
             skip_transfers: self.skip_transfers,
             lock_manager: self.lock_manager.clone(),
+            event_sender: self.event_sender,
         });
 
         while let Some(batch) = self.input_rx.recv().await {
@@ -1786,9 +1799,14 @@ impl<Src: BlockMetadata> ObjectTransferExecutor<Src> {
                 );
             }
 
-            // todo: merge the else part of this conditional and perhaps add the event tap for the successful transfers
-            // for block transfers we emit an event as part of registration; however, we don't register g4 blocks in the
-            // same way; therefore, we need a new convention on how we inform the broader system of the object creation
+            // Emit events for successful offloads so KV Router / indexer can track G4 tier.
+            // Unlike G1→G2/G2→G3 transfers, G4 blocks are not registered in a local
+            // BlockManager, so we emit events explicitly here.
+            if let Some(ref event_sender) = shared.event_sender {
+                for hash in &successful_hashes {
+                    let _ = event_sender.send(KvCacheEvent::Create(*hash));
+                }
+            }
 
             // Create meta files and release locks for successful transfers
             if let Some(lock_manager) = &shared.lock_manager {
@@ -2033,6 +2051,7 @@ mod tests {
             src_layout: LogicalLayoutHandle::G2,
             skip_transfers: false,
             lock_manager: None,
+            event_sender: None,
         };
 
         let transfer_id = crate::offload::handle::TransferId::new();
@@ -2109,6 +2128,7 @@ mod tests {
             src_layout: LogicalLayoutHandle::G2,
             skip_transfers: false,
             lock_manager: None,
+            event_sender: None,
         };
 
         let transfer_id = crate::offload::handle::TransferId::new();
@@ -2177,6 +2197,7 @@ mod tests {
             src_layout: LogicalLayoutHandle::G2,
             skip_transfers: false,
             lock_manager: None,
+            event_sender: None,
         };
 
         // Transfer A: blocks 100, 200 (200 will fail)
